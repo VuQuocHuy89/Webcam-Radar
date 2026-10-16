@@ -18,8 +18,12 @@ python web.py            # giao diện web: http://localhost:8000 (điện tho�
 python radar.py          # cửa sổ OpenCV, điều khiển bằng phím (xem đầu file)
 ```
 
+Giao diện web (`web.html`): trạng thái + 3 cung TRÁI/GIỮA/PHẢI, radar và camera (trên điện thoại radar lên đầu),
+nút chỉnh góc cúi / chiều cao / hiệu chỉnh. Khi NGUY HIỂM viền đỏ nhấp nháy và điện thoại rung; mất tín hiệu
+(camera, xử lý treo, mất wifi) hiện cảnh báo toàn màn hình.
+
 Tùy chọn chính của `web.py`: `--cam 1`, `--video file.mp4`, `--hfov 70`, `--height 1.5`, `--pitch 25`,
-`--no-pose`, `--no-depth` (nhanh hơn), `--depth-threads 4`, `--no-sensor` (không đọc cảm biến nghiêng), `--port 8000`.
+`--no-pose`, `--no-depth` (nhanh hơn), `--threads 4`, `--det-every 3`, `--imgsz 320`, `--no-sensor` (không đọc cảm biến nghiêng), `--port 8000`.
 
 ## Cách ước lượng khoảng cách
 

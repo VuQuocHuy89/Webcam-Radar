@@ -5,7 +5,9 @@ Chay:  python web.py [--cam 0] [--port 8000] [--hfov 70 --height 1.5 --pitch 25]
 Mo:    http://localhost:8000  (hoac http://<IP-laptop>:8000 tu dien thoai cung wifi)
 """
 import argparse
+import json
 import math
+import os
 import socket
 import subprocess
 import threading
@@ -20,32 +22,19 @@ import numpy as np
 import depth as D
 import radar as R
 
-PAGE = """<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Webcam Radar</title>
-<style>body{margin:0;background:#111;color:#ddd;font:14px sans-serif;text-align:center}
-img{max-width:100%;cursor:crosshair}button{margin:4px;padding:10px 14px;font-size:15px}
-#calib.on{background:#fc0}</style></head><body>
-<img id="v" src="/stream"><div>
-<button id="calib" onclick="cmd('calib');this.classList.toggle('on')">Hieu chinh (click diem cham san)</button>
-<button onclick="cmd('pitch_up')">Cui +1°</button><button onclick="cmd('pitch_down')">Cui -1°</button>
-<button onclick="cmd('h_up')">Cao +5cm</button><button onclick="cmd('h_down')">Cao -5cm</button>
-<button onclick="cmd('flip')">Lat</button><button onclick="cmd('mute')">Am thanh</button></div>
-<script>
-const v=document.getElementById('v'), cb=document.getElementById('calib');
-function cmd(c,q=''){fetch('/cmd?c='+c+q)}
-v.onclick=e=>{if(!cb.classList.contains('on'))return;
- const r=v.getBoundingClientRect(), s=v.naturalWidth/r.width;
- cmd('click','&x='+Math.round((e.clientX-r.left)*s)+'&y='+Math.round((e.clientY-r.top)*s));
- cb.classList.remove('on')}
-</script></body></html>"""
+PAGE = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "web.html"), encoding="utf-8").read()
 
 
 class App:
     def __init__(self, args):
+        import torch
         from ultralytics import YOLO
+        # Do tren may nay: 4 luong nhanh nhat (detect 26 ms, pose 42 ms); mac dinh 14 luong cham gap 3-5 lan
+        torch.set_num_threads(args.threads)
         self.model = YOLO(args.model)
         self.pose = None if args.no_pose else YOLO(args.pose_model)
         self.imgsz = args.imgsz
+        self.det_every, self.k = max(1, args.det_every), 0
         self.cap = cv2.VideoCapture(args.video if args.video else args.cam)
         if not args.video:
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -61,14 +50,13 @@ class App:
         self.depth = None
         if not args.no_depth:
             try:
-                self.depth = D.Depth(self.cam, args.depth_threads)
-                self.depth.start()
+                self.depth = D.Depth(self.cam)
             except ImportError as ex:
                 print("Khong co torch/transformers -> tat depth:", ex)
         self.beeper = R.Beeper()
         self.beeper.start()
         self.calib, self.click, self.flip = False, None, False
-        self.jpg = None
+        self.jpg, self.state = {}, {}
         self.cond = threading.Condition()
         self.tilt, self.roll, self.offset = None, 0.0, 0.0   # goc cui tu cam bien (do)
         if not args.no_sensor:
@@ -80,8 +68,8 @@ class App:
         ps = ("[Windows.Devices.Sensors.Accelerometer,Windows.Devices.Sensors,ContentType=WindowsRuntime]|Out-Null;"
               "$s=[Windows.Devices.Sensors.Accelerometer]::GetDefault(); if(!$s){exit};"
               "$c=[cultureinfo]::InvariantCulture; while($true){$r=$s.GetCurrentReading();"
-              "[Console]::WriteLine([string]::Format($c,'{0} {1} {2}',$r.AccelerationX,$r.AccelerationY,$r.AccelerationZ));"
-              "[Console]::Out.Flush(); Start-Sleep -Milliseconds 100}")
+              "try{[Console]::WriteLine([string]::Format($c,'{0} {1} {2}',$r.AccelerationX,$r.AccelerationY,$r.AccelerationZ));"
+              "[Console]::Out.Flush()}catch{exit}; Start-Sleep -Milliseconds 100}")
         try:
             p = subprocess.Popen(["powershell", "-NoProfile", "-Command", ps],
                                  stdout=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
@@ -121,12 +109,16 @@ class App:
                 frame = cv2.flip(frame, 1)
             if self.tilt is not None:
                 self.cam.pitch = math.radians(self.tilt + self.offset)
-            # Co pose: model detect chi tim do vat, nguoi lay tu model pose (co keypoint)
-            classes = [c for c in R.CLASSES if c] if self.pose else list(R.CLASSES)
-            res = self.model.predict(frame, imgsz=self.imgsz, conf=R.CONF,
-                                     classes=classes, verbose=False)[0]
-            dets = [(b, c, None) for b, c in zip(res.boxes.xyxy.cpu().numpy(),
-                                                 res.boxes.cls.cpu().numpy().astype(int))]
+            # Co pose: model detect chi tim do vat (do dung yen -> chay moi det_every khung,
+            # khung bo qua Kalman tu du doan), nguoi lay tu model pose (co keypoint) moi khung
+            self.k += 1
+            dets = []
+            if not self.pose or self.k % self.det_every == 0:
+                classes = [c for c in R.CLASSES if c] if self.pose else list(R.CLASSES)
+                res = self.model.predict(frame, imgsz=self.imgsz, conf=R.CONF,
+                                         classes=classes, verbose=False)[0]
+                dets = [(b, c, None) for b, c in zip(res.boxes.xyxy.cpu().numpy(),
+                                                     res.boxes.cls.cpu().numpy().astype(int))]
             if self.pose:
                 pr = self.pose.predict(frame, imgsz=self.imgsz, conf=R.CONF, verbose=False)[0]
                 kps = pr.keypoints.data.cpu().numpy() if pr.keypoints is not None else []
@@ -161,7 +153,7 @@ class App:
                         o["meas"].append((np.array(p), R.meas_cov(p[1], "depth")))
                         o["dep"] = True
             if self.depth:
-                self.depth.submit(frame, objs)
+                self.depth.step(frame, objs)
                 scan = self.depth.scan(R.RADAR_RANGE)
             tracks = self.kf.step(objs, time.time())
             overall = self.tracker.update(tracks + [dict(X=x, Z=z, r=math.hypot(x, z)) for x, z in scan])
@@ -174,20 +166,28 @@ class App:
             now = time.time()
             fps = 0.9 * fps + 0.1 / max(now - t_prev, 1e-6)
             t_prev = now
-            out = R.compose(R.draw_camera(vis, self.cam, [t for t in tracks if t["fresh"]], self.calib),
-                            R.draw_radar(self.h, self.cam, tracks, self.tracker, overall, scan),
-                            self.cam, fps, self.beeper, self.flip)
-            sensor = (f"cam bien {self.tilt:+.1f} lech {self.offset:+.1f} "
-                      f"ngang {self.roll:+.1f}deg | mu {self.cam.min_visible():.1f}m"
-                      if self.tilt is not None else "CAM BIEN: khong co (dung --pitch)")
-            R.put(out, sensor, (self.w + 10, self.h - 8), (200, 200, 200), 0.45)
-            if self.depth:
-                dep = (f"depth {self.depth.ms:.0f}ms neo {self.depth.n_anchor}" if self.depth.ready()
-                       else "depth: dang cho neo (can 1 nguoi/vat do tot)")
-                R.put(out, dep, (self.w + 10, self.h - 26), (200, 200, 200), 0.45)
+            cam_img = R.draw_camera(vis, self.cam, tracks, self.calib)
+            radar_img = R.draw_radar(self.h, self.cam, tracks, self.tracker, overall, scan, labels=False)
+            self.state = self.snapshot(overall, fps, len(tracks))
+            enc = [cv2.IMWRITE_JPEG_QUALITY, 80]
             with self.cond:
-                self.jpg = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes()
+                self.jpg = {"cam": cv2.imencode(".jpg", cam_img, enc)[1].tobytes(),
+                            "radar": cv2.imencode(".jpg", radar_img, enc)[1].tobytes()}
                 self.cond.notify_all()
+
+    def snapshot(self, overall, fps, n):
+        """Trang thai cho giao dien web (JSON)."""
+        tr, d = self.tracker, self.depth
+        return dict(
+            t=time.time(), level=overall, fps=round(fps, 1), n=n,
+            sectors=[dict(d=None if v == math.inf else round(v, 2), level=lv)
+                     for v, lv in zip(tr.d, tr.level)],
+            pitch=round(math.degrees(self.cam.pitch), 1), height=round(self.cam.height, 2),
+            blind=round(self.cam.min_visible(), 2),
+            tilt=None if self.tilt is None else round(self.tilt, 1),
+            offset=round(self.offset, 1), roll=round(self.roll, 1),
+            depth=None if not d else dict(ready=d.ready(), ms=round(d.ms), anchors=d.n_anchor),
+            muted=self.beeper.muted, flip=self.flip, calib=self.calib)
 
     def command(self, c, q):
         cam = self.cam
@@ -220,10 +220,15 @@ def make_handler(app):
 
         def do_GET(self):
             url = urlparse(self.path)
-            if url.path == "/":
-                body = PAGE.encode()
+            if url.path in ("/", "/state"):
+                html = url.path == "/"
+                st = dict(app.state)
+                if not html and time.time() - st.get("t", 0) > 1.5:   # xu ly treo / mat camera -> bao DO
+                    st.update(level=2, stale=True)
+                body = PAGE.encode() if html else json.dumps(st).encode()
                 self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Type", "text/html; charset=utf-8" if html else "application/json")
+                self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -233,6 +238,7 @@ def make_handler(app):
                 self.send_response(204)
                 self.end_headers()
             elif url.path == "/stream":
+                view = parse_qs(url.query).get("v", ["cam"])[0]   # cam | radar
                 self.send_response(200)
                 self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
                 self.end_headers()
@@ -240,7 +246,7 @@ def make_handler(app):
                     while True:
                         with app.cond:
                             app.cond.wait(timeout=2)
-                            jpg = app.jpg
+                            jpg = app.jpg.get(view)
                         if jpg:
                             self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -258,12 +264,13 @@ def main():
     ap.add_argument("--height", type=float, default=R.CAM_HEIGHT)
     ap.add_argument("--pitch", type=float, default=R.PITCH_DEG)
     ap.add_argument("--model", type=str, default=R.MODEL)
-    ap.add_argument("--imgsz", type=int, default=R.IMGSZ)
+    ap.add_argument("--imgsz", type=int, default=320, help="nho -> nhanh (416 neu can thay nguoi xa)")
+    ap.add_argument("--det-every", type=int, default=3, help="chay model do vat moi N khung")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--pose-model", type=str, default="yolo11n-pose.pt")
     ap.add_argument("--no-pose", action="store_true", help="tat model pose (nhanh hon)")
     ap.add_argument("--no-depth", action="store_true", help="tat depth model (nhanh hon)")
-    ap.add_argument("--depth-threads", type=int, default=4, help="so luong CPU cho torch")
+    ap.add_argument("--threads", type=int, default=4, help="so luong CPU cho torch (YOLO + depth)")
     ap.add_argument("--no-sensor", action="store_true",help="bo cam bien nghieng, dung --pitch co dinh")
     args = ap.parse_args()
 

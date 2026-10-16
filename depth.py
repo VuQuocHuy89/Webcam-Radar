@@ -5,7 +5,6 @@ Doi ra met bang cac "neo" da biet khoang cach (vat do tot bang hinh hoc/pose, sa
 Roi: (1) do khoang cach cho tung box -> them 1 phep do cho Kalman
      (2) quet vat can theo tung cot anh -> thay ca tuong, cua, cot (khong co trong COCO)."""
 import math
-import threading
 import time
 
 import cv2
@@ -18,18 +17,20 @@ MEAN, STD = np.array([0.485, 0.456, 0.406]), np.array([0.229, 0.224, 0.225])
 ANCHOR_MODES = ("ok", "pose", "san")
 OBST_H = (0.15, 1.9)             # m tren san: bo mat san va tran nha
 FIT_EMA = 0.3                    # lam muot he so a, b giua cac khung
+DEPTH_HZ = 4.0                   # 4 lan/giay: giu FPS cho YOLO, Kalman lo phan giua cac lan do
 
 
-class Depth(threading.Thread):
-    def __init__(self, cam, threads=4):
-        super().__init__(daemon=True)
+class Depth:
+    """Chay TUAN TU trong vong lap chinh (khong thread/process rieng): tren CPU lai (P/E core)
+    cho 2 model torch chay song song lam ca hai cham 3-5 lan; tuan tu thi moi model chay het toc."""
+
+    def __init__(self, cam):
         import torch
         from transformers import AutoModelForDepthEstimation
-        torch.set_num_threads(threads)
         self.torch = torch
         self.model = AutoModelForDepthEstimation.from_pretrained(MODEL_ID).eval()
         self.cam = cam
-        self.job, self.ev = None, threading.Event()
+        self.t_last = 0.0
         self.disp, self.fit, self.ms, self.n_anchor = None, None, 0.0, 0
         # Toa do tia cua moi o luoi (x, y chuan hoa) - tinh 1 lan
         u = (np.arange(GW) + 0.5) * cam.w / GW
@@ -37,25 +38,20 @@ class Depth(threading.Thread):
         self.gx = np.tile((u - cam.cx) / cam.f, (GH, 1))
         self.gy = np.tile(((v - cam.cy) / cam.f)[:, None], (1, GW))
 
-    def submit(self, frame, objs):
-        """Gui khung moi (bo qua neu dang ban) kem cac vat do tot lam neo."""
-        self.job = (frame, [(o["box"], o["Z"], o["mode"]) for o in objs])
-        self.ev.set()
-
-    def run(self):
-        while True:
-            self.ev.wait()
-            self.ev.clear()
-            frame, anchors = self.job
-            t = time.time()
-            x = (cv2.resize(frame, (IN_W, IN_H))[:, :, ::-1] / 255.0 - MEAN) / STD
-            with self.torch.inference_mode():
-                d = self.model(pixel_values=self.torch.from_numpy(
-                    x.transpose(2, 0, 1)[None].astype(np.float32))).predicted_depth[0].numpy()
-            disp = cv2.medianBlur(cv2.resize(d, (GW, GH)).astype(np.float32), 5)
-            self._fit(disp, anchors)
-            self.disp = disp
-            self.ms = (time.time() - t) * 1000
+    def step(self, frame, objs):
+        """Chay model neu da den luot (DEPTH_HZ), dung cac vat do tot trong objs lam neo."""
+        t = time.time()
+        if t - self.t_last < 1 / DEPTH_HZ:
+            return
+        self.t_last = t
+        x = (cv2.resize(frame, (IN_W, IN_H))[:, :, ::-1] / 255.0 - MEAN) / STD
+        with self.torch.inference_mode():
+            d = self.model(pixel_values=self.torch.from_numpy(
+                x.transpose(2, 0, 1)[None].astype(np.float32))).predicted_depth[0].numpy()
+        disp = cv2.medianBlur(cv2.resize(d, (GW, GH)).astype(np.float32), 5)
+        self._fit(disp, [(o["box"], o["Z"], o["mode"]) for o in objs])
+        self.disp = disp
+        self.ms = (time.time() - t) * 1000
 
     # ---------- doi do sau tuong doi -> met ----------
     def _cell(self, box):

@@ -424,7 +424,7 @@ def draw_camera(frame, cam, objs, calib):
     return img
 
 
-def draw_radar(size, cam, objs, tracker, overall, scan=()):
+def draw_radar(size, cam, objs, tracker, overall, scan=(), labels=True):
     img = np.full((size, size, 3), 22, np.uint8)
     ox, oy = size // 2, size - 25
     R = size - 60
@@ -483,7 +483,9 @@ def draw_radar(size, cam, objs, tracker, overall, scan=()):
     # Camera (minh)
     cv2.fillPoly(img, [np.array([[ox, oy - 12], [ox - 9, oy + 6], [ox + 9, oy + 6]])], (255, 255, 255))
 
-    # Tieu de
+    # Tieu de (ban web da hien tren trang -> labels=False)
+    if not labels:
+        return img
     put(img, LEVEL_NAME[overall], (12, 32), LEVEL_COLOR[overall], 0.9, 2)
     for i, name in enumerate(SECTOR_NAME):
         d = tracker.d[i]

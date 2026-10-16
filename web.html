@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14">
+<title>Webcam Radar</title>
+<style>
+  :root {
+    --bg: #0b0f14; --panel: #121820; --panel-2: #18202b; --line: #232d3a;
+    --text: #e6edf3; --muted: #8b98a8;
+    --safe: #2fbf71; --warn: #f5a524; --danger: #f04438;
+    --accent: #4c9aff;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { min-height: 100vh; padding: 16px; padding-bottom: calc(16px + env(safe-area-inset-bottom)); }
+  .wrap { max-width: 1280px; margin: 0 auto; display: grid; gap: 14px; }
+
+  /* Header */
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 650; font-size: 18px; letter-spacing: .2px; }
+  .live { width: 9px; height: 9px; border-radius: 50%; background: var(--safe); box-shadow: 0 0 0 0 var(--safe);
+    animation: ping 1.6s infinite; }
+  .live.off { background: var(--muted); animation: none; }
+  @keyframes ping { 0% { box-shadow: 0 0 0 0 rgba(47,191,113,.6); } 100% { box-shadow: 0 0 0 10px rgba(47,191,113,0); } }
+  .meta { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; display: flex; gap: 14px; }
+
+  /* Status */
+  .status { display: grid; grid-template-columns: minmax(0, 1.4fr) repeat(3, minmax(0, 1fr)); gap: 10px; }
+  .card { min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
+  .level { padding: 14px 18px; display: flex; flex-direction: column; justify-content: center;
+    border-color: transparent; transition: background .25s, box-shadow .25s; }
+  .level .label { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; opacity: .85; }
+  .level .value { font-size: 28px; font-weight: 750; letter-spacing: .5px; }
+  .level.l0 { background: color-mix(in srgb, var(--safe) 18%, var(--panel)); color: var(--safe); }
+  .level.l1 { background: color-mix(in srgb, var(--warn) 20%, var(--panel)); color: var(--warn); }
+  .level.l2 { background: var(--danger); color: #fff; animation: pulse .8s infinite alternate; }
+  @keyframes pulse { to { box-shadow: 0 0 0 6px rgba(240,68,56,.25); } }
+  .sector { padding: 12px 14px; border-top: 3px solid var(--line); }
+  .sector .name { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
+  .sector .dist { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .sector .dist small { font-size: 14px; font-weight: 500; color: var(--muted); margin-left: 2px; }
+  .sector.l0 { border-top-color: var(--safe); } .sector.l1 { border-top-color: var(--warn); }
+  .sector.l2 { border-top-color: var(--danger); } .sector.l2 .dist { color: var(--danger); }
+
+  /* Views */
+  .views { display: grid; grid-template-columns: minmax(0, 4fr) minmax(0, 3fr); gap: 14px; align-items: start; }
+  .view { overflow: hidden; position: relative; }
+  .view .title { position: absolute; top: 10px; left: 12px; z-index: 1; font-size: 12px; color: var(--text);
+    background: rgba(11,15,20,.7); padding: 3px 9px; border-radius: 999px; backdrop-filter: blur(4px); }
+  .view img { display: block; width: 100%; height: auto; background: #000; }
+  #cam.calib { cursor: crosshair; outline: 3px solid var(--warn); outline-offset: -3px; }
+  .hint { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); z-index: 1;
+    background: var(--warn); color: #111; font-weight: 600; font-size: 13px; padding: 6px 12px;
+    border-radius: 999px; display: none; white-space: nowrap; }
+  .calibrating .hint { display: block; }
+
+  /* Controls */
+  .controls { padding: 14px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+  .ctl { min-width: 0; background: var(--panel-2); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px;
+    display: flex; flex-direction: column; gap: 8px; }
+  .ctl .k { color: var(--muted); font-size: 12px; }
+  .ctl .v { font-size: 18px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .step { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .step .v { white-space: nowrap; }
+  button { font: inherit; color: var(--text); background: #222c39; border: 1px solid #2c3847; border-radius: 10px;
+    padding: 9px 12px; cursor: pointer; min-height: 40px; white-space: nowrap; transition: background .15s, border-color .15s; }
+  button:hover { background: #2a3646; }
+  button:active { transform: translateY(1px); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .step button { width: 44px; font-size: 18px; padding: 6px 0; }
+  .toggle.on { background: color-mix(in srgb, var(--accent) 30%, #222c39); border-color: var(--accent); }
+  .wide { flex: 1; width: 100%; }
+  #calibBtn.on { background: var(--warn); color: #111; border-color: var(--warn); font-weight: 650; }
+
+  .info { display: flex; flex-wrap: wrap; gap: 8px 18px; color: var(--muted); font-size: 13px; padding: 0 4px; }
+  .info b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; }
+
+  body.alarm { box-shadow: inset 0 0 0 4px var(--danger); }
+  .lost { display: none; position: fixed; inset: 0; z-index: 10; background: rgba(240,68,56,.92); color: #fff;
+    align-items: center; justify-content: center; font-size: 26px; font-weight: 750; text-align: center; padding: 24px; }
+  body.offline .lost { display: flex; }
+
+  @media (max-width: 900px) {
+    .views { grid-template-columns: minmax(0, 1fr); }
+    .views .radar { order: -1; }          /* tren dien thoai: radar len dau */
+    .controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @media (max-width: 560px) {
+    body { padding: 12px; }
+    .status { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .controls { padding: 10px; gap: 8px; }
+    .ctl { padding: 10px; }
+    .toggle { padding: 9px 4px; font-size: 14px; }
+    .level { grid-column: 1 / -1; }
+    .level .value { font-size: 24px; }
+    .sector .dist { font-size: 20px; }
+    .meta span:not(#fps) { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) { .live, .level.l2 { animation: none; } }
+</style>
+</head>
+<body>
+<div class="lost">MẤT TÍN HIỆU RADAR — DỪNG LẠI!</div>
+<div class="wrap">
+  <header>
+    <div class="brand"><span class="live" id="live"></span>Webcam Radar</div>
+    <div class="meta"><span id="objs">– vật</span><span id="fps">– FPS</span></div>
+  </header>
+
+  <section class="status" aria-live="polite">
+    <div class="card level l0" id="level"><span class="label">Trạng thái</span><span class="value" id="levelText">–</span></div>
+    <div class="card sector" id="s0"><div class="name">Trái</div><div class="dist">–</div></div>
+    <div class="card sector" id="s1"><div class="name">Giữa</div><div class="dist">–</div></div>
+    <div class="card sector" id="s2"><div class="name">Phải</div><div class="dist">–</div></div>
+  </section>
+
+  <section class="views">
+    <div class="card view" id="camView">
+      <span class="title">Camera</span>
+      <img id="cam" src="/stream?v=cam" alt="Hình camera với các vật được phát hiện">
+      <div class="hint">Đặt vật cách đúng 2 m · bấm vào điểm vật chạm sàn</div>
+    </div>
+    <div class="card view radar">
+      <span class="title">Radar (nhìn từ trên)</span>
+      <img src="/stream?v=radar" alt="Bản đồ radar nhìn từ trên xuống">
+    </div>
+  </section>
+
+  <section class="card controls">
+    <div class="ctl">
+      <span class="k">Góc cúi camera</span>
+      <div class="step"><button onclick="cmd('pitch_down')" aria-label="Giảm góc cúi">−</button>
+        <span class="v" id="pitch">–</span>
+        <button onclick="cmd('pitch_up')" aria-label="Tăng góc cúi">+</button></div>
+    </div>
+    <div class="ctl">
+      <span class="k">Chiều cao camera</span>
+      <div class="step"><button onclick="cmd('h_down')" aria-label="Giảm chiều cao">−</button>
+        <span class="v" id="height">–</span>
+        <button onclick="cmd('h_up')" aria-label="Tăng chiều cao">+</button></div>
+    </div>
+    <div class="ctl">
+      <span class="k">Hiệu chỉnh khoảng cách</span>
+      <button class="wide" id="calibBtn" onclick="cmd('calib')">Bắt đầu hiệu chỉnh</button>
+    </div>
+    <div class="ctl">
+      <span class="k">Tùy chọn</span>
+      <div class="step">
+        <button class="toggle wide" id="muteBtn" onclick="cmd('mute')">Âm thanh</button>
+        <button class="toggle wide" id="flipBtn" onclick="cmd('flip')">Lật ảnh</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="info">
+    <span><span class="dot" id="sensorDot"></span>Cảm biến nghiêng: <b id="tilt">–</b></span>
+    <span>Vùng mù: <b id="blind">–</b></span>
+    <span><span class="dot" id="depthDot"></span>Depth: <b id="depth">–</b></span>
+    <span>Ký hiệu: <b>*</b> pose · <b>d</b> depth · <b>&lt;</b> vùng mù · <b>~</b> bị che</span>
+  </section>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const NAMES = ["AN TOÀN", "CHÚ Ý", "NGUY HIỂM"];
+const COLORS = ["var(--safe)", "var(--warn)", "var(--danger)"];
+let st = {}, fails = 0, lastBuzz = 0;
+
+function cmd(c, q = "") { fetch("/cmd?c=" + c + q).then(poll); }
+
+$("cam").addEventListener("click", e => {
+  if (!st.calib) return;
+  const img = e.currentTarget, r = img.getBoundingClientRect(), s = img.naturalWidth / r.width;
+  cmd("click", "&x=" + Math.round((e.clientX - r.left) * s) + "&y=" + Math.round((e.clientY - r.top) * s));
+});
+
+function render(s) {
+  st = s;
+  const lv = s.level ?? 0;
+  $("level").className = "card level l" + lv;
+  $("levelText").textContent = NAMES[lv];
+  document.body.classList.toggle("alarm", lv === 2);
+  (s.sectors || []).forEach((x, i) => {
+    const el = $("s" + i);
+    el.className = "card sector l" + x.level;
+    el.querySelector(".dist").innerHTML = x.d == null ? "–" : x.d.toFixed(1) + "<small>m</small>";
+  });
+  $("fps").textContent = (s.fps ?? 0).toFixed(1) + " FPS";
+  $("objs").textContent = (s.n ?? 0) + " vật";
+  $("pitch").textContent = s.pitch.toFixed(1) + "°";
+  $("height").textContent = s.height.toFixed(2) + " m";
+  $("blind").textContent = s.blind.toFixed(1) + " m";
+  $("tilt").textContent = s.tilt == null ? "không có (dùng góc cố định)"
+    : `${s.tilt > 0 ? "+" : ""}${s.tilt.toFixed(1)}° · lệch ${s.offset.toFixed(1)}°`;
+  $("sensorDot").style.background = s.tilt == null ? "var(--muted)" : "var(--safe)";
+  const d = s.depth;
+  $("depth").textContent = !d ? "tắt" : d.ready ? `${d.ms} ms · ${d.anchors} neo` : "đang chờ neo";
+  $("depthDot").style.background = !d ? "var(--muted)" : d.ready ? "var(--safe)" : "var(--warn)";
+  $("muteBtn").classList.toggle("on", !s.muted);
+  $("muteBtn").textContent = s.muted ? "Đã tắt tiếng" : "Âm thanh";
+  $("flipBtn").classList.toggle("on", s.flip);
+  $("calibBtn").classList.toggle("on", s.calib);
+  $("calibBtn").textContent = s.calib ? "Hủy hiệu chỉnh" : "Bắt đầu hiệu chỉnh";
+  $("camView").classList.toggle("calibrating", s.calib);
+  $("cam").classList.toggle("calib", s.calib);
+  // Dien thoai: rung khi nguy hiem (toi da 1 lan / 0.6 s)
+  if (lv === 2 && navigator.vibrate && Date.now() - lastBuzz > 600) { navigator.vibrate(150); lastBuzz = Date.now(); }
+}
+
+function poll() {
+  return fetch("/state", { cache: "no-store" }).then(r => r.json()).then(s => {
+    fails = 0; document.body.classList.remove("offline"); $("live").classList.remove("off");
+    if (s.level !== undefined) render(s);
+    if (s.stale) { document.body.classList.add("offline"); $("live").classList.add("off"); }
+  }).catch(() => {
+    // Mat ket noi -> mac dinh an toan: bao dong
+    if (++fails >= 3) { document.body.classList.add("offline"); $("live").classList.add("off"); }
+  });
+}
+setInterval(poll, 200);
+poll();
+</script>
+</body>
+</html>
