@@ -21,14 +21,14 @@ DEPTH_HZ = 4.0                   # 4 lan/giay: giu FPS cho YOLO, Kalman lo phan 
 
 
 class Depth:
-    """Chay TUAN TU trong vong lap chinh (khong thread/process rieng): tren CPU lai (P/E core)
-    cho 2 model torch chay song song lam ca hai cham 3-5 lan; tuan tu thi moi model chay het toc."""
+    """Chay TUAN TU trong vong lap chinh: ho tro CUDA GPU (hoac CPU neu khong co CUDA)."""
 
     def __init__(self, cam):
         import torch
         from transformers import AutoModelForDepthEstimation
         self.torch = torch
-        self.model = AutoModelForDepthEstimation.from_pretrained(MODEL_ID).eval()
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = AutoModelForDepthEstimation.from_pretrained(MODEL_ID).eval().to(self.device)
         self.cam = cam
         self.t_last = 0.0
         self.disp, self.fit, self.ms, self.n_anchor = None, None, 0.0, 0
@@ -46,8 +46,9 @@ class Depth:
         self.t_last = t
         x = (cv2.resize(frame, (IN_W, IN_H))[:, :, ::-1] / 255.0 - MEAN) / STD
         with self.torch.inference_mode():
-            d = self.model(pixel_values=self.torch.from_numpy(
-                x.transpose(2, 0, 1)[None].astype(np.float32))).predicted_depth[0].numpy()
+            pixel_values = self.torch.from_numpy(
+                x.transpose(2, 0, 1)[None].astype(np.float32)).to(self.device)
+            d = self.model(pixel_values=pixel_values).predicted_depth[0].cpu().numpy()
         disp = cv2.medianBlur(cv2.resize(d, (GW, GH)).astype(np.float32), 5)
         self._fit(disp, [(o["box"], o["Z"], o["mode"]) for o in objs])
         self.disp = disp
