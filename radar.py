@@ -245,6 +245,92 @@ def resolve_occlusion(objs):
     return objs
 
 
+# ======================= KALMAN TRACKING =======================
+# Sai so do tuong doi theo cach uoc luong: sigma_Z = REL * Z
+MEAS_REL = {"ok": 0.08, "pose": 0.08, "san": 0.12, "cao": 0.15, "depth": 0.15, "hc": 0.25, "che": 0.30}
+SAT_SIGMA = 0.6    # vat trong vung mu: Z bi ep ve ~1.45 m, chi biet la "gan"
+ACCEL = 2.0        # m/s^2 nhieu qua trinh (nguoi di + minh cam lap di bo)
+GATE = 9.21        # chi^2 2 bac tu do, 99%: ngoai nguong -> khong ghep
+TRACK_TTL = 0.7    # s giu track (du doan theo van toc) khi mat dau
+
+
+def meas_cov(Z, mode):
+    """Ma tran hiep phuong sai do (X, Z). Huong ngang (goc) chinh xac hon khoang cach nhieu."""
+    sz = SAT_SIGMA if mode == "sat" else MEAS_REL.get(mode, 0.2) * Z + 0.05
+    sx = 0.1 + 0.03 * Z
+    return np.diag([sx * sx, sz * sz])
+
+
+def fuse(meas):
+    """Gop nhieu phep do [(z, R)] cua cung 1 vat (hinh hoc, pose, depth) theo dang thong tin."""
+    info = sum(np.linalg.inv(R) for _, R in meas)
+    R = np.linalg.inv(info)
+    return R @ sum(np.linalg.inv(Ri) @ z for z, Ri in meas), R
+
+
+class Track:
+    """Kalman van toc khong doi, trang thai [X, Z, vX, vZ]."""
+
+    def __init__(self, o, z, R, t, tid):
+        self.x = np.array([z[0], z[1], 0.0, 0.0])
+        self.P = np.diag([R[0, 0], R[1, 1], 1.0, 1.0])
+        self.t = self.seen = t
+        self.o, self.id = o, tid
+
+    def predict(self, t):
+        dt, self.t = t - self.t, t
+        F = np.eye(4)
+        F[0, 2] = F[1, 3] = dt
+        G = np.array([[dt * dt / 2, 0], [0, dt * dt / 2], [dt, 0], [0, dt]])
+        self.x = F @ self.x
+        self.P = F @ self.P @ F.T + G @ G.T * ACCEL ** 2
+
+    def innovation(self, z, R):
+        return z - self.x[:2], self.P[:2, :2] + R
+
+    def update(self, z, R):
+        y, S = self.innovation(z, R)
+        K = self.P[:, :2] @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        self.P = (np.eye(4) - K[:, :2] @ np.eye(2, 4)) @ self.P
+
+
+class KalmanTracker:
+    def __init__(self):
+        self.tracks, self.next_id = [], 0
+
+    def step(self, objs, t):
+        """objs: moi vat co 'meas' = [(z, R), ...]. Tra ve danh sach track (da loc)."""
+        for tr in self.tracks:
+            tr.predict(t)
+        fused = [fuse(o["meas"]) for o in objs]
+        pairs = []
+        for i, tr in enumerate(self.tracks):
+            for j, (o, (z, R)) in enumerate(zip(objs, fused)):
+                if (tr.o["cls"] == 0) != (o["cls"] == 0):      # nguoi chi ghep voi nguoi
+                    continue
+                y, S = tr.innovation(z, R)
+                d2 = float(y @ np.linalg.solve(S, y))
+                if d2 < GATE:
+                    pairs.append((d2, i, j))
+        used_t, used_o = set(), set()
+        for _, i, j in sorted(pairs):                          # ghep tham lam theo Mahalanobis
+            if i not in used_t and j not in used_o:
+                tr = self.tracks[i]
+                tr.update(*fused[j])
+                tr.o, tr.seen = objs[j], t
+                used_t.add(i)
+                used_o.add(j)
+        for j, o in enumerate(objs):
+            if j not in used_o:
+                self.tracks.append(Track(o, *fused[j], t, self.next_id))
+                self.next_id += 1
+        self.tracks = [tr for tr in self.tracks if t - tr.seen < TRACK_TTL]
+        return [dict(tr.o, X=tr.x[0], Z=tr.x[1], r=math.hypot(tr.x[0], tr.x[1]),
+                     vx=tr.x[2], vz=tr.x[3], id=tr.id, fresh=tr.seen == t)
+                for tr in self.tracks if tr.x[1] > 0.05]
+
+
 def level_of(d, prev=0):
     """Phan vung co do tre: vao vung nguy hiem ngay, ra vung an toan phai vuot them HYST."""
     if d < D_RED or (prev == 2 and d < D_RED + HYST):
@@ -327,7 +413,8 @@ def draw_camera(frame, cam, objs, calib):
         col = LEVEL_COLOR[level_of(o["r"])]
         cv2.rectangle(img, (x1, y1), (x2, y2), col, 2)
         cv2.circle(img, ((x1 + x2) // 2, y2), 4, col, -1)  # diem cham san
-        mark = {"sat": "<", "hc": "~", "che": "~", "pose": "*"}.get(o["mode"], "")
+        mark = {"sat": "<", "hc": "~", "che": "~", "pose": "*", "depth": "d"}.get(o["mode"], "")
+        mark += "d" if o.get("dep") else ""
         tag = f'{o["name"]} {mark}{o["r"]:.1f}m'
         put(img, tag, (x1 + 2, max(y1 - 6, 14)), col, 0.5)
     if calib:
@@ -337,7 +424,7 @@ def draw_camera(frame, cam, objs, calib):
     return img
 
 
-def draw_radar(size, cam, objs, tracker, overall):
+def draw_radar(size, cam, objs, tracker, overall, scan=()):
     img = np.full((size, size, 3), 22, np.uint8)
     ox, oy = size // 2, size - 25
     R = size - 60
@@ -374,12 +461,19 @@ def draw_radar(size, cam, objs, tracker, overall):
         cv2.line(img, (ox, oy), (int(ox + R * math.cos(ang)), int(oy + R * math.sin(ang))),
                  (90, 90, 90) if e in (a0, a1) else (50, 50, 50), 1, cv2.LINE_AA)
 
-    # Vat can
+    # Diem quet tu depth (tuong, cua... ke ca vat khong nhan dien duoc)
+    for x, z in scan:
+        cv2.circle(img, (int(ox + x * scale), int(oy - z * scale)), 2, (170, 170, 170), -1)
+
+    # Vat can (track Kalman)
     for o in objs:
         if o["Z"] > RADAR_RANGE + 0.3:
             continue
         px, py = int(ox + o["X"] * scale), int(oy - o["Z"] * scale)
         col = LEVEL_COLOR[level_of(o["r"])]
+        if "vx" in o and math.hypot(o["vx"], o["vz"]) > 0.2:      # mui ten: vi tri sau 1 s
+            cv2.arrowedLine(img, (px, py), (int(px + o["vx"] * scale), int(py - o["vz"] * scale)),
+                            col, 1, cv2.LINE_AA, tipLength=0.25)
         if o["cls"] == 0:
             cv2.circle(img, (px, py), 8, col, -1)
         else:

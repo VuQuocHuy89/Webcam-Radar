@@ -15,7 +15,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import cv2
+import numpy as np
 
+import depth as D
 import radar as R
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
@@ -55,6 +57,14 @@ class App:
         self.h, self.w = frame.shape[:2]
         self.cam = R.Camera(self.w, self.h, args.hfov, args.height, args.pitch)
         self.tracker = R.SectorTracker(args.hfov)
+        self.kf = R.KalmanTracker()
+        self.depth = None
+        if not args.no_depth:
+            try:
+                self.depth = D.Depth(self.cam, args.depth_threads)
+                self.depth.start()
+            except ImportError as ex:
+                print("Khong co torch/transformers -> tat depth:", ex)
         self.beeper = R.Beeper()
         self.beeper.start()
         self.calib, self.click, self.flip = False, None, False
@@ -121,6 +131,7 @@ class App:
                 pr = self.pose.predict(frame, imgsz=self.imgsz, conf=R.CONF, verbose=False)[0]
                 kps = pr.keypoints.data.cpu().numpy() if pr.keypoints is not None else []
                 dets += [(b, 0, k) for b, k in zip(pr.boxes.xyxy.cpu().numpy(), kps)]
+            vis = frame.copy()                           # ve keypoint len ban sao, depth dung anh goc
             objs = []
             for box, c, kp in dets:
                 e = R.estimate(self.cam, box, c)
@@ -130,13 +141,30 @@ class App:
                         e = (*p, "pose")
                     for x, y, s in kp:
                         if s > R.KP_CONF:
-                            cv2.circle(frame, (int(x), int(y)), 3, (255, 255, 0), -1)
+                            cv2.circle(vis, (int(x), int(y)), 3, (255, 255, 0), -1)
+                if e is None and self.depth and self.depth.ready():
+                    p = self.depth.measure(box)
+                    e = (*p, "depth") if p else None
                 if e:
                     X, Z, mode = e
                     objs.append(dict(box=box, cls=c, name=R.CLASSES[c], X=X, Z=Z,
                                      r=math.hypot(X, Z), mode=mode))
             R.resolve_occlusion(objs)
-            overall = self.tracker.update(objs)
+
+            # Moi vat: phep do hinh hoc/pose + (neu do khong tot) phep do depth -> Kalman gop
+            scan = []
+            for o in objs:
+                o["meas"] = [(np.array([o["X"], o["Z"]]), R.meas_cov(o["Z"], o["mode"]))]
+                if self.depth and o["mode"] not in D.ANCHOR_MODES + ("depth",):
+                    p = self.depth.measure(o["box"])
+                    if p:
+                        o["meas"].append((np.array(p), R.meas_cov(p[1], "depth")))
+                        o["dep"] = True
+            if self.depth:
+                self.depth.submit(frame, objs)
+                scan = self.depth.scan(R.RADAR_RANGE)
+            tracks = self.kf.step(objs, time.time())
+            overall = self.tracker.update(tracks + [dict(X=x, Z=z, r=math.hypot(x, z)) for x, z in scan])
             self.beeper.level = overall
             if self.click:
                 self.cam.calibrate_pitch(*self.click, R.CALIB_DIST)
@@ -146,13 +174,17 @@ class App:
             now = time.time()
             fps = 0.9 * fps + 0.1 / max(now - t_prev, 1e-6)
             t_prev = now
-            out = R.compose(R.draw_camera(frame, self.cam, objs, self.calib),
-                            R.draw_radar(self.h, self.cam, objs, self.tracker, overall),
+            out = R.compose(R.draw_camera(vis, self.cam, [t for t in tracks if t["fresh"]], self.calib),
+                            R.draw_radar(self.h, self.cam, tracks, self.tracker, overall, scan),
                             self.cam, fps, self.beeper, self.flip)
             sensor = (f"cam bien {self.tilt:+.1f} lech {self.offset:+.1f} "
                       f"ngang {self.roll:+.1f}deg | mu {self.cam.min_visible():.1f}m"
                       if self.tilt is not None else "CAM BIEN: khong co (dung --pitch)")
             R.put(out, sensor, (self.w + 10, self.h - 8), (200, 200, 200), 0.45)
+            if self.depth:
+                dep = (f"depth {self.depth.ms:.0f}ms neo {self.depth.n_anchor}" if self.depth.ready()
+                       else "depth: dang cho neo (can 1 nguoi/vat do tot)")
+                R.put(out, dep, (self.w + 10, self.h - 26), (200, 200, 200), 0.45)
             with self.cond:
                 self.jpg = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes()
                 self.cond.notify_all()
@@ -230,7 +262,9 @@ def main():
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--pose-model", type=str, default="yolo11n-pose.pt")
     ap.add_argument("--no-pose", action="store_true", help="tat model pose (nhanh hon)")
-    ap.add_argument("--no-sensor",action="store_true", help="bo cam bien nghieng, dung --pitch co dinh")
+    ap.add_argument("--no-depth", action="store_true", help="tat depth model (nhanh hon)")
+    ap.add_argument("--depth-threads", type=int, default=4, help="so luong CPU cho torch")
+    ap.add_argument("--no-sensor", action="store_true",help="bo cam bien nghieng, dung --pitch co dinh")
     args = ap.parse_args()
 
     app = App(args)
